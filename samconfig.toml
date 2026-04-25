@@ -1,0 +1,15 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name   = "mega-demo-logging"
+region       = "us-west-2"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM"
+resolve_s3   = true
+
+# Fill these in before deploying — do NOT commit real values.
+# Pass them on the CLI instead:
+#   sam deploy --parameter-overrides \
+#     SlackWebhookUrl=https://hooks.slack.com/... \
+#     ApiKeyValue=<your-secret-key>
+parameter_overrides = ""

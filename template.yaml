@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Logging API — forwards errors to CloudWatch and Slack
+
+Parameters:
+  SlackWebhookUrl:
+    Type: String
+    NoEcho: true
+    Description: Incoming webhook URL for the target Slack channel
+  ApiKeyValue:
+    Type: String
+    NoEcho: true
+    Description: Secret key callers must supply in the X-Api-Key header
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 10
+    MemorySize: 128
+    Architectures: [arm64]
+
+Resources:
+
+  LoggingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: mega-demo-logger
+      Handler: src/handler.handler
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          API_KEY: !Ref ApiKeyValue
+      Events:
+        Post:
+          Type: Api
+          Properties:
+            RestApiId: !Ref LoggingApi
+            Path: /log
+            Method: POST
+
+  LoggingApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: mega-demo-logging-api
+      StageName: prod
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Api-Key'"
+        AllowOrigin: "'*'"
+
+  # CloudWatch log group with 90-day retention
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LoggingFunction}'
+      RetentionInDays: 90
+
+Outputs:
+  ApiEndpoint:
+    Description: POST to this URL to log an event
+    Value: !Sub 'https://${LoggingApi}.execute-api.${AWS::Region}.amazonaws.com/prod/log'
