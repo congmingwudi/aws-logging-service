@@ -114,17 +114,40 @@ is supported.
 ```
 
 `channel` is a **key** into the service's `SLACK_WEBHOOK_ROUTES` map — not a raw
-webhook URL. Deploy the routes as a JSON string parameter:
+webhook URL, and not a literal Slack channel name. Deploy the routes as a JSON
+string parameter:
 
 ```json
 {
   "mega-demo":     "https://hooks.slack.com/services/AAA/BBB/CCC",
   "claude-notify": "https://hooks.slack.com/services/AAA/BBB/DDD",
-  "billing":       ["https://hooks.slack.com/.../ops", "https://hooks.slack.com/.../finance"]
+  "billing-alerts": ["https://hooks.slack.com/.../ops", "https://hooks.slack.com/.../finance"]
 }
 ```
 
-A route may map to a single URL or an array (fan-out to multiple channels).
+Each Slack incoming webhook URL is bound to exactly one channel — that binding
+is fixed on Slack's side when you create the webhook, and the service has no
+way to redirect a URL to a different channel at request time.
+
+**A route key mapping to an array is a fan-out, not a menu.** `"billing-alerts":
+[urlA, urlB]` means every event routed to `billing-alerts` posts to *both*
+channels A and B, every time — the client doesn't pick which one, it always
+gets the union. Use this when one logical event should always mirror to
+multiple fixed channels together (e.g. `#eng-oncall` and `#status-page`).
+
+**If you want a client to choose between distinct channels**, give each
+channel its own route key, and have the client pass the specific key it wants:
+
+```json
+{
+  "billing-alerts-eng":     "https://hooks.slack.com/.../eng",
+  "billing-alerts-finance": "https://hooks.slack.com/.../finance"
+}
+```
+
+```json
+{ "type": "slack", "channel": "billing-alerts-eng" }
+```
 
 ### Resolution rules
 
