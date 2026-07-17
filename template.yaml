@@ -1,12 +1,20 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Logging API — forwards errors to CloudWatch and Slack
+Description: General-purpose logging API — forwards events to CloudWatch and Slack
 
 Parameters:
   SlackWebhookUrl:
     Type: String
     NoEcho: true
-    Description: Incoming webhook URL for the target Slack channel
+    Description: Default Slack incoming webhook (used when no per-source route matches)
+  SlackWebhookRoutes:
+    Type: String
+    NoEcho: true
+    Default: '{}'
+    Description: >
+      Optional JSON object mapping source (or channel) name → Slack webhook URL,
+      or → array of webhook URLs. Example:
+      {"mega-demo":"https://hooks.slack.com/...","claude-notify":["https://.../a","https://.../b"]}
   ApiKeyValue:
     Type: String
     NoEcho: true
@@ -29,6 +37,7 @@ Resources:
       Environment:
         Variables:
           SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          SLACK_WEBHOOK_ROUTES: !Ref SlackWebhookRoutes
           API_KEY: !Ref ApiKeyValue
       Events:
         Post:
@@ -37,6 +46,10 @@ Resources:
             RestApiId: !Ref LoggingApi
             Path: /log
             Method: POST
+            RequestModel:
+              Model: LogEvent
+              Required: true
+              ValidateBody: true
 
   LoggingApi:
     Type: AWS::Serverless::Api
@@ -47,6 +60,42 @@ Resources:
         AllowMethods: "'POST,OPTIONS'"
         AllowHeaders: "'Content-Type,X-Api-Key'"
         AllowOrigin: "'*'"
+      Models:
+        LogEvent:
+          type: object
+          additionalProperties: false
+          properties:
+            source:
+              type: string
+              minLength: 1
+              maxLength: 128
+            level:
+              type: string
+              enum: [error, warn, info, success, notify]
+            message:
+              type: string
+              maxLength: 4000
+            timestamp:
+              type: string
+              format: date-time
+            detail:
+              oneOf:
+                - type: string
+                - type: object
+            targets:
+              type: array
+              maxItems: 16
+              items:
+                type: object
+                required: [type]
+                properties:
+                  type:
+                    type: string
+                    enum: [slack]
+                  channel:
+                    type: string
+                    minLength: 1
+                    maxLength: 128
 
   # CloudWatch log group with 90-day retention
   LogGroup:

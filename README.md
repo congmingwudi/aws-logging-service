@@ -1,6 +1,40 @@
 # aws-logging-service
 
-A minimal serverless logging API that receives events from the TDX '26 Mega Demo app, writes them to CloudWatch Logs, and posts notifications to Slack.
+A minimal, dependency-free serverless logging API — the single logging endpoint
+across all of my projects.
+
+Any client (browser app, Node.js service, CLI tool, Claude Code hook, cron job,
+…) POSTs a structured log event with a shared API key. The service:
+
+1. Writes it to CloudWatch Logs (90-day retention).
+2. Delivers a Slack notification to one or more channels — either explicit
+   destinations chosen by the client (`targets`) or a default route based on
+   the client's `source`.
+
+Originally built for the TDX '26 Mega Demo, now the primary logging service
+for anything that needs "tell me in Slack when X happened, and keep a searchable
+record of it."
+
+## Design goals
+
+- **One endpoint, many callers.** Every project points at the same URL and
+  key. No per-project infrastructure.
+- **Data-configured fan-out.** Routing lives in a JSON parameter
+  (`SlackWebhookRoutes`), not in code. Adding a new destination = updating the
+  deploy parameter, not editing the handler.
+- **Callers choose the destination, but not the URL.** A client says
+  `{"type":"slack","channel":"claude-notify"}` and the service resolves that key
+  server-side. Clients can never POST to arbitrary webhooks — the service owns
+  the whitelist.
+- **Explicit routing wins; implicit routing is safe.** If a client sends
+  `targets`, that is exactly where the event goes. If they omit it, the service
+  falls back to source-based routing plus the default webhook (matching the
+  original Mega Demo behavior).
+- **Extensible target types.** `targets` is a discriminated union on `type`
+  — currently `slack` is the only kind, but future kinds (email, generic
+  webhook, PagerDuty, SMS…) plug in without breaking existing clients.
+- **Fail-soft.** Notification failures are logged but never turn into HTTP 5xx.
+  A Slack outage doesn't take the logging API down with it.
 
 ## Tech Stack
 
@@ -8,9 +42,9 @@ A minimal serverless logging API that receives events from the TDX '26 Mega Demo
 |-------|------------|
 | Runtime | Node.js 22.x (ESM) |
 | Compute | AWS Lambda (arm64 / Graviton) |
-| API | AWS API Gateway HTTP API |
+| API | AWS API Gateway REST API (with request body validation) |
 | Logging | AWS CloudWatch Logs (90-day retention) |
-| Notifications | Slack Incoming Webhook |
+| Notifications | Slack Incoming Webhooks (extensible to other targets) |
 | IaC | AWS SAM (CloudFormation) |
 | Region | us-west-2 |
 
@@ -19,21 +53,23 @@ No npm dependencies — uses only the Node.js 22 built-in `fetch` API.
 ## Architecture
 
 ```
-App (browser)
+Any client
   → POST /log  (X-Api-Key header)
-    → API Gateway HTTP API (us-west-2)
+    → API Gateway (validates body against schema in template.yaml)
       → Lambda Function (Node.js 22, arm64, 128 MB)
           ├─ stdout → CloudWatch Logs  (/aws/lambda/mega-demo-logger, 90-day retention)
-          └─ fetch  → Slack Incoming Webhook → #logs channel
+          └─ Target dispatch:
+             • `targets` present → deliver to those and only those
+             • `targets` absent  → source-based route + default SlackWebhookUrl
+             Slack channel keys are resolved server-side via SLACK_WEBHOOK_ROUTES.
 ```
 
-The Lambda function (`src/handler.mjs`) handles everything in one file:
-1. Validates the `X-Api-Key` header against the `API_KEY` environment variable
-2. Parses and validates the JSON request body
-3. Logs a structured JSON entry to stdout (captured by CloudWatch)
-4. POSTs a formatted notification to Slack (failures are logged but don't affect the HTTP response)
+Everything lives in one Lambda function (`src/handler.mjs`). Infrastructure is
+`template.yaml` (AWS SAM). The stack name is `mega-demo-logging` (kept for
+backwards compatibility with the deployed API URL that clients already point at).
 
-Infrastructure is defined in `template.yaml` (AWS SAM). Stack name: `mega-demo-logging`.
+The canonical request schema is in [`openapi.yaml`](./openapi.yaml) and is
+mirrored into API Gateway's request model in `template.yaml`.
 
 ## Request Format
 
@@ -43,18 +79,78 @@ X-Api-Key: <your-api-key>
 Content-Type: application/json
 
 {
-  "source":  "mega-demo",
-  "level":   "error|warn|info",
-  "message": "Human-readable description",
-  "detail":  "optional string or object"
+  "source":    "mega-demo",
+  "level":     "error|warn|info|success|notify",
+  "message":   "Human-readable description",
+  "timestamp": "2026-07-11T18:22:04.123Z",
+  "detail":    "optional string or object",
+  "targets":   [
+    { "type": "slack", "channel": "claude-notify" }
+  ]
 }
 ```
+
+All fields are optional. Behavior when omitted:
+
+| Field | Default |
+|-------|---------|
+| `source` | `"unknown"` |
+| `level` | `"error"` |
+| `message` | `"(no message)"` |
+| `timestamp` | server's receipt time |
+| `detail` | omitted |
+| `targets` | implicit routing (see below) |
+
+## Targets and routing
+
+### Target types
+
+Each entry in `targets` is a discriminated union on `type`. Today only `slack`
+is supported.
+
+**Slack target**
+```json
+{ "type": "slack", "channel": "claude-notify" }
+```
+
+`channel` is a **key** into the service's `SLACK_WEBHOOK_ROUTES` map — not a raw
+webhook URL. Deploy the routes as a JSON string parameter:
+
+```json
+{
+  "mega-demo":     "https://hooks.slack.com/services/AAA/BBB/CCC",
+  "claude-notify": "https://hooks.slack.com/services/AAA/BBB/DDD",
+  "billing":       ["https://hooks.slack.com/.../ops", "https://hooks.slack.com/.../finance"]
+}
+```
+
+A route may map to a single URL or an array (fan-out to multiple channels).
+
+### Resolution rules
+
+- **`targets` present** → deliver ONLY to the listed targets. Unresolvable
+  entries (unknown `type`, unknown Slack channel key, missing required fields)
+  are logged and skipped. `targets: []` is valid and means "CloudWatch only."
+- **`targets` absent** → implicit routing: if `source` matches a route key,
+  deliver to those webhook(s) plus the default; otherwise deliver only to the
+  default `SlackWebhookUrl`. This matches pre-`targets` behavior — legacy
+  clients (like the Mega Demo) work unchanged.
+
+### Adding future target kinds
+
+To add e.g. `email`:
+1. Add a new arm in `openapi.yaml`'s `Target` schema (`EmailTarget` component).
+2. Extend `template.yaml`'s `Models.LogEvent.properties.targets.items.properties` to include the new fields.
+3. Add a dispatch branch in `resolveTargets()` inside `src/handler.mjs`.
+4. Bump the OpenAPI version and redeploy.
+
+Existing clients keep working because they never send the new `type`.
 
 ## Deployment
 
 ### Prerequisites
 
-- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) configured (`aws configure`)
+- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) configured (`aws configure` or SSO)
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
 
 Verify both:
@@ -63,21 +159,34 @@ aws sts get-caller-identity
 sam --version
 ```
 
-### 1. Generate an API key
+### 1. Generate an API key (first deploy only)
 
 ```bash
 openssl rand -hex 32
 ```
 
-Save this — you'll use it as `ApiKeyValue` below and as `VITE_LOGGING_API_KEY` in the client app.
+Save it — you'll use it as `ApiKeyValue` below and as `LOGGING_API_KEY` in every
+client. Rotating this later requires updating every consumer, so store it in a
+password manager.
 
-### 2. Build and deploy
+### 2. Create Slack webhooks
+
+For each Slack channel you want the service to deliver to (personal `#logs`,
+`claude-notify`, project-specific channels, …), create an incoming webhook at
+[api.slack.com/apps](https://api.slack.com/apps) → your app → Incoming Webhooks →
+Add New Webhook to Workspace → pick the channel → copy the URL.
+
+### 3. Build and deploy
 
 ```bash
-sam build && sam deploy --parameter-overrides "SlackWebhookUrl=<your-slack-webhook-url> ApiKeyValue=<your-generated-key>"
+sam build && sam deploy --parameter-overrides \
+  "SlackWebhookUrl=<default-webhook-url>" \
+  "SlackWebhookRoutes={\"claude-notify\":\"https://hooks.slack.com/services/.../claude-channel\"}" \
+  "ApiKeyValue=<your-generated-key>"
 ```
 
-Both overrides must be in a single quoted string, space-separated.
+The `SlackWebhookRoutes` parameter is optional (defaults to `{}`) but is what
+lets clients target specific channels.
 
 SAM will print the API endpoint at the end:
 ```
@@ -85,41 +194,201 @@ Outputs:
   ApiEndpoint  https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log
 ```
 
-### 3. Smoke test
+### 4. Smoke test
 
 ```bash
+# Legacy path — no targets, uses source-based default routing:
 curl -s -X POST \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: <your-api-key>" \
   -d '{"source":"test","level":"info","message":"deploy smoke test"}' \
   https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log
+
+# Explicit target — should hit ONLY the claude-notify channel:
+curl -s -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Api-Key: <your-api-key>" \
+  -d '{"source":"test","level":"success","message":"targets test","targets":[{"type":"slack","channel":"claude-notify"}]}' \
+  https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log
 ```
 
-Expected: `{"ok":true}` response and a message in Slack `#logs` within seconds.
+Both should return `{"ok":true}` and post to the corresponding Slack channels.
 
 Check CloudWatch logs:
 ```bash
 aws logs tail /aws/lambda/mega-demo-logger --follow --region us-west-2
 ```
 
-### 4. Wire up the client app
-
-Set these environment variables in the consuming app:
-```
-VITE_LOGGING_API_URL=https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log
-VITE_LOGGING_API_KEY=<your-generated-key>
-```
-
-## Redeployment
+### 5. Redeployment
 
 After any changes to `src/handler.mjs` or `template.yaml`:
 
 ```bash
-sam build && sam deploy --parameter-overrides "SlackWebhookUrl=<your-slack-webhook-url> ApiKeyValue=<your-api-key>"
+sam build && sam deploy --parameter-overrides \
+  "SlackWebhookUrl=..." "SlackWebhookRoutes=..." "ApiKeyValue=..."
 ```
+
+The `samconfig.toml` file leaves `parameter_overrides` empty by design — pass
+secrets on the CLI only, never commit them.
+
+## Wiring in a client app (browser / Node)
+
+```
+LOGGING_API_URL=https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log
+LOGGING_API_KEY=<your-generated-key>
+```
+
+Post errors / events with `fetch`:
+
+```js
+await fetch(process.env.LOGGING_API_URL, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'X-Api-Key': process.env.LOGGING_API_KEY },
+  body: JSON.stringify({
+    source: 'my-app',
+    level: 'error',
+    message: 'thing broke',
+    detail: { stack: err.stack },
+    // Optional: explicit target
+    // targets: [{ type: 'slack', channel: 'claude-notify' }],
+  }),
+});
+```
+
+Vite apps use `VITE_LOGGING_API_URL` / `VITE_LOGGING_API_KEY` so the values are
+exposed to the browser bundle.
+
+## Claude Code notification hook
+
+The repo ships a POSIX bash script — `hooks/claude-notify.sh` — that reads a
+Claude Code hook event on stdin and POSTs a log event to this service. Wire it
+into any project (or globally in `~/.claude/settings.json`) to get Slack pings
+when Claude finishes a task, a subagent completes, or Claude is awaiting input.
+
+### One-time service configuration
+
+1. Create a new Slack incoming webhook pointing at the channel you want Claude
+   notifications in.
+2. Redeploy the service with a `SlackWebhookRoutes` entry for `claude-notify`
+   (or any key name you prefer — this doc uses `claude-notify` consistently):
+
+   ```bash
+   sam build && sam deploy --parameter-overrides \
+     "SlackWebhookUrl=<default-webhook>" \
+     "SlackWebhookRoutes={\"claude-notify\":\"<claude-channel-webhook>\"}" \
+     "ApiKeyValue=<your-api-key>"
+   ```
+
+### Configuring the hook in a Claude Code project
+
+Two options — global (every project) or per-project.
+
+**Option A — global, in `~/.claude/settings.json`:**
+
+Every Claude Code session in every directory will send hook events.
+
+```json
+{
+  "env": {
+    "LOGGING_API_URL": "https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log",
+    "LOGGING_API_KEY": "<your-api-key>",
+    "LOGGING_CHANNEL": "claude-notify"
+  },
+  "hooks": {
+    "Stop":         [{"hooks": [{"type": "command", "command": "/Users/ryan.cox/projects/tdx26/aws-logging-service/hooks/claude-notify.sh"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "/Users/ryan.cox/projects/tdx26/aws-logging-service/hooks/claude-notify.sh"}]}],
+    "Notification": [{"hooks": [{"type": "command", "command": "/Users/ryan.cox/projects/tdx26/aws-logging-service/hooks/claude-notify.sh"}]}]
+  }
+}
+```
+
+**Option B — per-project, in `<project>/.claude/settings.json`:**
+
+Only enabled inside that specific repo. Same JSON as above; put it in the
+project's own settings file instead of the global one. Useful when you only want
+notifications for long-running projects and not throwaway experiments.
+
+**Option C — per-project source override:**
+
+By default the hook tags every event with `source = basename(pwd)` (e.g., the
+repo directory name). To force a specific source label per project, add
+`LOGGING_SOURCE` to that project's `.claude/settings.json` `env` block:
+
+```json
+{
+  "env": {
+    "LOGGING_SOURCE": "my-critical-app"
+  }
+}
+```
+
+Project-level `env` merges with global `env`, so you can set the URL/key once
+globally and override just `LOGGING_SOURCE` per project.
+
+### Environment contract
+
+The hook script reads these:
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `LOGGING_API_URL` | yes | Full URL of the `/log` endpoint |
+| `LOGGING_API_KEY` | yes | `X-Api-Key` header value |
+| `LOGGING_CHANNEL` | no  | Slack channel key from `SLACK_WEBHOOK_ROUTES`. If set, the script emits `targets: [{type:"slack", channel: LOGGING_CHANNEL}]`. If unset, no `targets` is sent and the service falls back to source-based routing. |
+| `LOGGING_SOURCE`  | no  | Override the event `source` (defaults to `basename $PWD`) |
+| `LOGGING_LEVEL`   | no  | Force a specific level; otherwise derived from the hook event name |
+
+### Level derivation
+
+The script maps the Claude hook event to a log level:
+
+| Hook event | Level sent | Slack indicator |
+|------------|-----------|-----------------|
+| `Stop` | `success` | :large_green_circle: |
+| `SubagentStop` | `success` | :large_green_circle: |
+| `Notification` (Claude awaiting input) | `notify` | :bell: |
+| `PreToolUse` / `PostToolUse` | `info` | :large_blue_circle: |
+| anything else | `info` | :large_blue_circle: |
+
+Override with `LOGGING_LEVEL` in `env` if you want e.g. `notify` for `Stop` too.
+
+### What ends up in Slack
+
+- **Text:** `<emoji> *[<source>]* <summary>` where `<summary>` is the hook's
+  `message` / `stop_reason` / `notification.message` (whichever the payload has),
+  falling back to `"<hook_event> in <repo>"`.
+- **Attachment (code block):** the full hook JSON, plus `cwd` and `hook_event`
+  added by the script. Useful for debugging what triggered the ping.
+
+### Failure behavior
+
+The script exits `0` on any error (missing env vars, network failure, JSON parse
+error). Claude Code is **never** blocked by a logging outage. Errors go to
+stderr, which Claude Code surfaces in its hook logs.
+
+### Prerequisites
+
+- The hook script is executable (`chmod +x hooks/claude-notify.sh` — done in this repo).
+- `bash` (macOS/Linux). Windows requires WSL or a bash-in-PATH.
+- `jq` is optional but recommended (safer JSON escaping). Without it the script
+  falls back to hand-built JSON.
+- `curl` (standard on macOS and most Linux).
+
+### Verifying the hook end-to-end
+
+1. Configure `~/.claude/settings.json` per Option A above.
+2. Start a Claude Code session in any directory and let it finish a task.
+3. On `Stop`, you should see a green-circle message in your `claude-notify`
+   channel within a couple of seconds.
+4. In CloudWatch, `aws logs tail /aws/lambda/mega-demo-logger --region us-west-2`
+   should show the corresponding structured log line with the full hook payload
+   in `detail`.
 
 ## Teardown
 
 ```bash
 aws cloudformation delete-stack --stack-name mega-demo-logging --region us-west-2
 ```
+
+This deletes the API Gateway, Lambda, and CloudWatch log group. The Slack
+webhooks themselves are not touched (revoke them in the Slack app dashboard if
+you need to).

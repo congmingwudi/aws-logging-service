@@ -1,0 +1,161 @@
+openapi: 3.0.3
+info:
+  title: aws-logging-service
+  description: >
+    General-purpose logging API. Receives structured log events from any
+    client, records them to CloudWatch, and delivers notifications to one or
+    more explicit `targets` (currently: Slack channels resolved through the
+    `SLACK_WEBHOOK_ROUTES` environment map). When no `targets` are supplied,
+    the service falls back to routing by `source` plus a default webhook.
+  version: 1.2.0
+
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/prod
+    variables:
+      apiId:
+        default: example
+      region:
+        default: us-west-2
+
+paths:
+  /log:
+    post:
+      operationId: postLog
+      summary: Record a log event
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogEvent'
+      responses:
+        '200':
+          description: Event accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          description: Invalid JSON body or schema validation failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or incorrect X-Api-Key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    options:
+      summary: CORS preflight
+      responses:
+        '200':
+          description: CORS headers
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+
+  schemas:
+    LogEvent:
+      type: object
+      additionalProperties: false
+      description: >
+        A single log event. All fields are optional; the server fills
+        sensible defaults when values are omitted.
+      properties:
+        source:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >
+            Identifier for the emitting app or subsystem. Used as a routing
+            key against `SLACK_WEBHOOK_ROUTES`.
+          example: mega-demo
+        level:
+          type: string
+          description: Severity or category. Unknown values fall back to a neutral indicator.
+          enum: [error, warn, info, success, notify]
+          example: error
+        message:
+          type: string
+          maxLength: 4000
+          description: Human-readable summary of the event.
+          example: ElevenLabs TTS request failed
+        timestamp:
+          type: string
+          format: date-time
+          description: >
+            Client-supplied ISO 8601 timestamp for when the event occurred.
+            When omitted, the server stamps the time of receipt.
+          example: '2026-07-11T18:22:04.123Z'
+        detail:
+          description: Optional extra context. Strings are passed through; objects are JSON-stringified for Slack.
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+        targets:
+          type: array
+          maxItems: 16
+          description: >
+            Optional list of destinations for this event. When present, the
+            event is delivered ONLY to the listed targets (an empty array is
+            valid and means "CloudWatch only"). When absent, the service
+            falls back to routing by `source` plus the default webhook.
+            Unresolvable targets are logged and skipped — they never fall
+            back to the default.
+          items:
+            $ref: '#/components/schemas/Target'
+          example:
+            - type: slack
+              channel: claude-notify
+
+    Target:
+      type: object
+      required: [type]
+      discriminator:
+        propertyName: type
+        mapping:
+          slack: '#/components/schemas/SlackTarget'
+      oneOf:
+        - $ref: '#/components/schemas/SlackTarget'
+
+    SlackTarget:
+      type: object
+      required: [type, channel]
+      description: >
+        A Slack destination. `channel` is a logical key resolved against the
+        service's `SLACK_WEBHOOK_ROUTES` map — NOT a raw webhook URL. Unknown
+        keys are silently skipped so clients cannot POST to arbitrary webhooks.
+      properties:
+        type:
+          type: string
+          enum: [slack]
+        channel:
+          type: string
+          minLength: 1
+          maxLength: 128
+          example: claude-notify
+
+    OkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          example: true
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: Unauthorized
