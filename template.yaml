@@ -7,14 +7,15 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Default Slack incoming webhook (used when no per-source route matches)
-  SlackWebhookRoutes:
+  SlackWebhookRoutesParameterName:
     Type: String
-    NoEcho: true
-    Default: '{}'
+    Default: '/mega-demo-logging/slack-webhook-routes'
     Description: >
-      Optional JSON object mapping source (or channel) name → Slack webhook URL,
-      or → array of webhook URLs. Example:
-      {"mega-demo":"https://hooks.slack.com/...","claude-notify":["https://.../a","https://.../b"]}
+      Name of the SSM Parameter Store parameter holding the routes map (a JSON
+      object mapping source/channel name → Slack webhook URL, or → array of
+      webhook URLs). Not managed by this template — create/update its value
+      directly with `aws ssm put-parameter`, which takes effect without a
+      redeploy. See README "Targets and routing" for the update command.
   ApiKeyValue:
     Type: String
     NoEcho: true
@@ -37,8 +38,13 @@ Resources:
       Environment:
         Variables:
           SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
-          SLACK_WEBHOOK_ROUTES: !Ref SlackWebhookRoutes
+          SLACK_WEBHOOK_ROUTES_PARAMETER_NAME: !Ref SlackWebhookRoutesParameterName
           API_KEY: !Ref ApiKeyValue
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SlackWebhookRoutesParameterName}'
       Events:
         Post:
           Type: Api

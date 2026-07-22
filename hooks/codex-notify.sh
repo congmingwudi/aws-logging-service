@@ -2,28 +2,14 @@
 # Codex hook -> aws-logging-service bridge.
 #
 # Reads a Codex lifecycle-hook JSON event from stdin and posts the same log
-# shape as ~/.claude/hooks/claude-notify.sh. Logging failures never block Codex.
+# shape as ~/.claude/hooks/claude-notify.sh. Logging settings come from Codex's
+# shell_environment_policy. Logging failures never block Codex.
 
 set -u
 
-claude_settings="${CODEX_NOTIFY_SETTINGS:-/Users/ryan.cox/.claude/settings.json}"
 api_url="${LOGGING_API_URL:-}"
 api_key="${LOGGING_API_KEY:-}"
 channel="${LOGGING_CHANNEL:-}"
-
-# Reuse the existing Claude notification configuration without copying its
-# secret into Codex's hooks.json. Explicit environment variables still win.
-if command -v jq >/dev/null 2>&1 && [[ -r "$claude_settings" ]]; then
-  if [[ -z "$api_url" ]]; then
-    api_url="$(jq -r '.env.LOGGING_API_URL // empty' "$claude_settings" 2>/dev/null || true)"
-  fi
-  if [[ -z "$api_key" ]]; then
-    api_key="$(jq -r '.env.LOGGING_API_KEY // empty' "$claude_settings" 2>/dev/null || true)"
-  fi
-  if [[ -z "$channel" ]]; then
-    channel="$(jq -r '.env.LOGGING_CHANNEL // empty' "$claude_settings" 2>/dev/null || true)"
-  fi
-fi
 
 if [[ -z "$api_url" || -z "$api_key" ]]; then
   echo "codex-notify: LOGGING_API_URL and LOGGING_API_KEY must be set" >&2

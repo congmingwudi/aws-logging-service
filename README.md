@@ -19,9 +19,9 @@ record of it."
 
 - **One endpoint, many callers.** Every project points at the same URL and
   key. No per-project infrastructure.
-- **Data-configured fan-out.** Routing lives in a JSON parameter
-  (`SlackWebhookRoutes`), not in code. Adding a new destination = updating the
-  deploy parameter, not editing the handler.
+- **Data-configured fan-out.** Routing lives in a JSON map in SSM Parameter
+  Store, not in code. Adding a new destination = one `aws ssm put-parameter`
+  call, not editing the handler or redeploying.
 - **Callers choose the destination, but not the URL.** A client says
   `{"type":"slack","channel":"claude-notify"}` and the service resolves that key
   server-side. Clients can never POST to arbitrary webhooks — the service owns
@@ -48,7 +48,9 @@ record of it."
 | IaC | AWS SAM (CloudFormation) |
 | Region | us-west-2 |
 
-No npm dependencies — uses only the Node.js 22 built-in `fetch` API.
+No npm dependencies — uses the Node.js 22 built-in `fetch` API plus
+`@aws-sdk/client-ssm`, which ships bundled inside the Lambda Node.js runtime
+itself (no `package.json`/`npm install` needed).
 
 ## Architecture
 
@@ -61,8 +63,36 @@ Any client
           └─ Target dispatch:
              • `targets` present → deliver to those and only those
              • `targets` absent  → source-based route + default SlackWebhookUrl
-             Slack channel keys are resolved server-side via SLACK_WEBHOOK_ROUTES.
+             Slack channel keys are resolved server-side against a routes map
+             fetched from SSM Parameter Store (cached in-memory for 60s).
 ```
+
+```mermaid
+flowchart TD
+    subgraph Clients["Any client, one shared API key"]
+        M[Mega Demo browser app]
+        C[Claude Code hook]
+        X[Codex hook]
+    end
+
+    M --> GW
+    C --> GW
+    X --> GW
+
+    GW["API Gateway<br/>POST /log"] --> L["Lambda handler.mjs"]
+
+    L --> CW[("CloudWatch Logs<br/>90-day retention")]
+    L <--> SSM[("SSM Parameter Store<br/>Slack routes map")]
+
+    L --> S1["Slack: claude-notify"]
+    L --> S2["Slack: codex-notify"]
+    L --> S3["Slack: default webhook"]
+```
+
+One Lambda function fronts every caller. It always writes to CloudWatch, then
+resolves Slack destinations by checking each request's `targets` (or, if
+absent, the `source`) against the routes map cached from SSM — new
+clients/channels are just a new routes-map entry, never a code change.
 
 Everything lives in one Lambda function (`src/handler.mjs`). Infrastructure is
 `template.yaml` (AWS SAM). The stack name is `mega-demo-logging` (kept for
@@ -113,9 +143,11 @@ is supported.
 { "type": "slack", "channel": "claude-notify" }
 ```
 
-`channel` is a **key** into the service's `SLACK_WEBHOOK_ROUTES` map — not a raw
-webhook URL, and not a literal Slack channel name. Deploy the routes as a JSON
-string parameter:
+`channel` is a **key** into the service's routes map — not a raw webhook URL,
+and not a literal Slack channel name. The routes map is a JSON object stored
+in an SSM Parameter Store parameter (default name
+`/mega-demo-logging/slack-webhook-routes`, configurable via the
+`SlackWebhookRoutesParameterName` deploy parameter):
 
 ```json
 {
@@ -123,6 +155,15 @@ string parameter:
   "claude-notify": "https://hooks.slack.com/services/AAA/BBB/DDD",
   "billing-alerts": ["https://hooks.slack.com/.../ops", "https://hooks.slack.com/.../finance"]
 }
+```
+
+Update it directly — no redeploy needed (see "Adding or changing a Slack
+route" under Deployment):
+
+```bash
+aws ssm put-parameter --name /mega-demo-logging/slack-webhook-routes \
+  --type String --overwrite \
+  --value '{"mega-demo":"...","claude-notify":"...","billing-alerts":["...","..."]}'
 ```
 
 Each Slack incoming webhook URL is bound to exactly one channel — that binding
@@ -169,6 +210,36 @@ To add e.g. `email`:
 
 Existing clients keep working because they never send the new `type`.
 
+## Environment variables vs. SSM Parameter Store
+
+Two different mechanisms configure this service — don't confuse them:
+
+| Config | Where it lives | How to change it | Redeploy needed? |
+|--------|-----------------|-------------------|-------------------|
+| `SLACK_WEBHOOK_URL` | Lambda env var, set from the `SlackWebhookUrl` CloudFormation parameter | `sam deploy --parameter-overrides "SlackWebhookUrl=..."` | Yes |
+| `API_KEY` | Lambda env var, set from the `ApiKeyValue` CloudFormation parameter | `sam deploy --parameter-overrides "ApiKeyValue=..."` | Yes |
+| `SLACK_WEBHOOK_ROUTES_PARAMETER_NAME` | Lambda env var, set from the `SlackWebhookRoutesParameterName` CloudFormation parameter | `sam deploy --parameter-overrides "SlackWebhookRoutesParameterName=..."` (rarely needed — it just holds the SSM *parameter name*, not the routes themselves) | Yes |
+| **The Slack routes map itself** | SSM Parameter Store, at the name above (default `/mega-demo-logging/slack-webhook-routes`) | `aws ssm put-parameter --name ... --overwrite --value '{...}'` | **No** |
+
+The routes map used to be its own CloudFormation parameter
+(`SlackWebhookRoutes`), baked into the Lambda as an env var at deploy time.
+It was moved to SSM because:
+
+1. **Routing changes constantly; code/infra doesn't.** Adding a Slack
+   channel is an operational change, not a code change — it shouldn't need
+   `sam build && sam deploy`.
+2. **`sam deploy --parameter-overrides` corrupts JSON values containing
+   commas, silently.** See the Gotcha below — this bit us in practice.
+   SSM's `put-parameter` takes the value as a single argument with no
+   comma-splitting parser in the way.
+3. **Faster iteration.** The handler caches the routes map for 60 seconds,
+   so an SSM update takes effect on the next request (or within a minute) —
+   no cold start, no CloudFormation changeset, no waiting on `sam deploy`.
+
+The three env vars above still go through CloudFormation because they change
+rarely (default webhook, API key, SSM parameter name) — only the
+frequently-churning routing data moved out.
+
 ## Deployment
 
 ### Prerequisites
@@ -204,12 +275,13 @@ Add New Webhook to Workspace → pick the channel → copy the URL.
 ```bash
 sam build && sam deploy --parameter-overrides \
   "SlackWebhookUrl=<default-webhook-url>" \
-  "SlackWebhookRoutes={\"claude-notify\":\"https://hooks.slack.com/services/.../claude-channel\"}" \
   "ApiKeyValue=<your-generated-key>"
 ```
 
-The `SlackWebhookRoutes` parameter is optional (defaults to `{}`) but is what
-lets clients target specific channels.
+`SlackWebhookRoutesParameterName` defaults to
+`/mega-demo-logging/slack-webhook-routes` and rarely needs overriding — see
+step 4 below for seeding its value. Only pass it if you want a different SSM
+parameter name (e.g. running a second stack).
 
 SAM will print the API endpoint at the end:
 ```
@@ -217,7 +289,21 @@ Outputs:
   ApiEndpoint  https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log
 ```
 
-### 4. Smoke test
+### 4. Seed the Slack routes map in SSM
+
+The routes map lives in SSM Parameter Store, not in a deploy parameter (see
+"Adding or changing a Slack route" below for why). On first deploy, create it:
+
+```bash
+aws ssm put-parameter --name /mega-demo-logging/slack-webhook-routes \
+  --type String \
+  --value '{"claude-notify":"<claude-channel-webhook>"}'
+```
+
+The Lambda's execution role is scoped to `ssm:GetParameter` on exactly this
+parameter ARN (see `template.yaml`'s `LoggingFunction.Policies`).
+
+### 5. Smoke test
 
 ```bash
 # Legacy path — no targets, uses source-based default routing:
@@ -242,17 +328,68 @@ Check CloudWatch logs:
 aws logs tail /aws/lambda/mega-demo-logger --follow --region us-west-2
 ```
 
-### 5. Redeployment
+### 6. Redeployment
 
 After any changes to `src/handler.mjs` or `template.yaml`:
 
 ```bash
 sam build && sam deploy --parameter-overrides \
-  "SlackWebhookUrl=..." "SlackWebhookRoutes=..." "ApiKeyValue=..."
+  "SlackWebhookUrl=..." "ApiKeyValue=..."
 ```
 
 The `samconfig.toml` file leaves `parameter_overrides` empty by design — pass
 secrets on the CLI only, never commit them.
+
+Note: adding or changing a Slack channel is **not** a reason to redeploy — see
+the next section.
+
+### Adding or changing a Slack route
+
+Slack routing lives entirely in SSM Parameter Store, not in a deploy
+parameter — so onboarding a new Slack channel (or changing an existing
+webhook URL) is a single command, no `sam deploy` required:
+
+```bash
+aws ssm put-parameter --name /mega-demo-logging/slack-webhook-routes \
+  --type String --overwrite \
+  --value '{"claude-notify":"...","codex-notify":"...","new-key":"..."}'
+```
+
+Always pass the **full** map — `put-parameter --overwrite` replaces the
+value, it doesn't merge keys into the existing one. The handler caches the
+routes map in memory for 60 seconds, so a change takes effect within that
+window without needing a cold start.
+
+This design was chosen specifically to avoid a class of bug where
+`sam deploy --parameter-overrides` silently corrupts a JSON parameter value —
+see "Gotcha: `--parameter-overrides` and JSON values containing commas" below.
+
+### Gotcha: `--parameter-overrides` and JSON values containing commas
+
+`sam deploy --parameter-overrides` (and `aws cloudformation deploy` in its
+default shorthand form) parses `Key=Value` pairs by splitting on commas and
+spaces. A JSON value that itself contains a comma — e.g. a routes map with
+more than one key — gets silently truncated at the first comma, with **no
+error and no warning**. The deploy reports success; the Lambda ends up with a
+broken value (in one incident, `SLACK_WEBHOOK_ROUTES` was chopped down to
+just `{`), and every route lookup fails quietly — the API still returns
+`{"ok":true}`, CloudWatch logs the event fine, and the only symptom is a
+`WARN ... not in webhook routes — skipping` line you have to know to look for.
+
+This is exactly why Slack routing was moved to SSM (previous section) — it
+removes JSON-with-commas from the deploy path entirely. The remaining deploy
+parameters (`SlackWebhookUrl`, `ApiKeyValue`, `SlackWebhookRoutesParameterName`)
+are plain strings without commas, so they aren't at risk, but keep this in
+mind if a future parameter ever needs to hold structured/JSON data:
+
+- **Safe alternative:** pass a JSON parameters file instead of an inline
+  string — `aws cloudformation deploy --parameter-overrides file://params.json`
+  where `params.json` is `[{"ParameterKey": "...", "ParameterValue": "..."}, ...]`.
+  This bypasses the comma-splitting shorthand parser entirely.
+- `sam deploy` itself does not accept `file://` for `--parameter-overrides` —
+  use `sam package` to produce a template, then `aws cloudformation deploy`
+  with the file, if a comma-containing value ever needs to go through
+  CloudFormation again.
 
 ## Wiring in a client app (browser / Node)
 
@@ -309,15 +446,14 @@ are already organized (e.g. `~/.aisuite/hooks/`, `~/.devbar/bin/`).
 **1. One-time service configuration:**
 
 Create a new Slack incoming webhook pointing at the channel you want Claude
-notifications in, then redeploy the service with a `SlackWebhookRoutes` entry
-for `claude-notify` (or any key name you prefer — this doc uses `claude-notify`
-consistently):
+notifications in, then add a `claude-notify` entry (or any key name you
+prefer — this doc uses `claude-notify` consistently) to the routes map in SSM
+— no redeploy needed (see "Adding or changing a Slack route" above):
 
 ```bash
-sam build && sam deploy --parameter-overrides \
-  "SlackWebhookUrl=<default-webhook>" \
-  "SlackWebhookRoutes={\"claude-notify\":\"<claude-channel-webhook>\"}" \
-  "ApiKeyValue=<your-api-key>"
+aws ssm put-parameter --name /mega-demo-logging/slack-webhook-routes \
+  --type String --overwrite \
+  --value '{"claude-notify":"<claude-channel-webhook>"}'
 ```
 
 **2. Install the script into the global hooks directory:**
@@ -380,7 +516,7 @@ The hook script reads these:
 |----------|----------|---------|
 | `LOGGING_API_URL` | yes | Full URL of the `/log` endpoint |
 | `LOGGING_API_KEY` | yes | `X-Api-Key` header value |
-| `LOGGING_CHANNEL` | no  | Slack channel key from `SLACK_WEBHOOK_ROUTES`. If set, the script emits `targets: [{type:"slack", channel: LOGGING_CHANNEL}]`. If unset, no `targets` is sent and the service falls back to source-based routing. |
+| `LOGGING_CHANNEL` | no  | Slack channel key from the routes map (see "Targets and routing"). If set, the script emits `targets: [{type:"slack", channel: LOGGING_CHANNEL}]`. If unset, no `targets` is sent and the service falls back to source-based routing. |
 | `LOGGING_SOURCE`  | no  | Override the event `source` (defaults to `basename $PWD`) |
 | `LOGGING_LEVEL`   | no  | Force a specific level; otherwise derived from the hook event name |
 
@@ -435,32 +571,33 @@ stderr, which Claude Code surfaces in its hook logs.
 The repo also ships `hooks/codex-notify.sh` — the same idea as the Claude Code
 hook, but for [Codex](https://openai.com/codex) lifecycle hooks. It reads a
 Codex hook JSON event on stdin and POSTs the same log shape to this service,
-so Codex sessions can ping Slack too (routed independently via its own
-`SLACK_WEBHOOK_ROUTES` key, `codex-notify`, kept parallel to `claude-notify`).
+so Codex sessions can ping Slack too (routed independently via its own routes
+map key, `codex-notify`, kept parallel to `claude-notify`).
 
-### Credential reuse
+### Credentials
 
-Unlike the Claude hook, `codex-notify.sh` doesn't require its own copy of
-`LOGGING_API_URL` / `LOGGING_API_KEY`. If those aren't set in the environment,
-it falls back to reading `env.LOGGING_API_URL` / `env.LOGGING_API_KEY` /
-`env.LOGGING_CHANNEL` out of `~/.claude/settings.json` (path overridable via
-`CODEX_NOTIFY_SETTINGS`) via `jq`. This avoids duplicating the API key into a
-second config file — set explicit environment variables in Codex's own hook
-config only if you want Codex to use different credentials or a different
-`LOGGING_CHANNEL` than Claude Code.
+`codex-notify.sh` reads `LOGGING_API_URL`, `LOGGING_API_KEY`, and
+`LOGGING_CHANNEL` directly from the environment Codex invokes it with —
+configure these in Codex's own `shell_environment_policy` (or equivalent hook
+env config), the same values used for the Claude hook. There is no fallback
+to `~/.claude/settings.json`; if `LOGGING_API_URL`/`LOGGING_API_KEY` aren't
+set, the script exits silently (fail-soft, per its failure policy below)
+without posting anything.
 
 ### One-time service configuration
 
 Create a new Slack incoming webhook for the channel you want Codex
-notifications in, then redeploy with a `codex-notify` entry in
-`SlackWebhookRoutes` alongside any existing routes:
+notifications in, then add a `codex-notify` entry to the routes map in SSM
+alongside any existing routes — no redeploy needed:
 
 ```bash
-sam build && sam deploy --parameter-overrides \
-  "SlackWebhookUrl=<default-webhook>" \
-  "SlackWebhookRoutes={\"claude-notify\":\"<claude-channel-webhook>\",\"codex-notify\":\"<codex-channel-webhook>\"}" \
-  "ApiKeyValue=<your-api-key>"
+aws ssm put-parameter --name /mega-demo-logging/slack-webhook-routes \
+  --type String --overwrite \
+  --value '{"claude-notify":"<claude-channel-webhook>","codex-notify":"<codex-channel-webhook>"}'
 ```
+
+Remember: `--overwrite` replaces the whole map, so include every existing key
+you want to keep, not just the new one.
 
 ### Install the script
 
@@ -475,9 +612,9 @@ chmod +x ~/.codex/hooks/codex-notify.sh
 ```
 
 Point Codex's own hook configuration (e.g. its `Stop` / `PermissionRequest`
-equivalents) at `~/.codex/hooks/codex-notify.sh`, and set `LOGGING_CHANNEL=codex-notify`
-if you want Codex events routed to its own channel rather than inheriting
-whatever `LOGGING_CHANNEL` Claude Code's settings specify.
+equivalents) at `~/.codex/hooks/codex-notify.sh`, and set
+`LOGGING_API_URL`, `LOGGING_API_KEY`, and `LOGGING_CHANNEL=codex-notify` in
+Codex's `shell_environment_policy` so the hook has everything it needs.
 
 ### Level derivation
 

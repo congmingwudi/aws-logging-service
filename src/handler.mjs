@@ -1,7 +1,26 @@
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+
 const DEFAULT_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const EXPECTED_API_KEY = process.env.API_KEY;
+const ROUTES_PARAMETER_NAME = process.env.SLACK_WEBHOOK_ROUTES_PARAMETER_NAME;
+const ROUTES_CACHE_TTL_MS = 60_000;
 
-const WEBHOOK_ROUTES = parseRoutes(process.env.SLACK_WEBHOOK_ROUTES);
+const ssm = new SSMClient();
+let routesCache = { value: {}, fetchedAt: 0 };
+
+async function getWebhookRoutes() {
+  if (!ROUTES_PARAMETER_NAME) return {};
+  if (Date.now() - routesCache.fetchedAt < ROUTES_CACHE_TTL_MS) return routesCache.value;
+
+  try {
+    const { Parameter } = await ssm.send(new GetParameterCommand({ Name: ROUTES_PARAMETER_NAME }));
+    routesCache = { value: parseRoutes(Parameter?.Value), fetchedAt: Date.now() };
+  } catch (err) {
+    console.error('Failed to fetch SLACK_WEBHOOK_ROUTES_PARAMETER_NAME from SSM — using last known routes:', err.message);
+    routesCache = { ...routesCache, fetchedAt: Date.now() };
+  }
+  return routesCache.value;
+}
 
 const LEVEL_EMOJI = {
   error: ':red_circle:',
@@ -23,19 +42,19 @@ function parseRoutes(raw) {
   return {};
 }
 
-// Resolve one Slack channel key against SLACK_WEBHOOK_ROUTES.
+// Resolve one Slack channel key against the routes map.
 // Returns an array of webhook URLs (a channel may map to multiple).
-function resolveSlackChannel(channelKey) {
-  const routed = WEBHOOK_ROUTES[channelKey];
+function resolveSlackChannel(routes, channelKey) {
+  const routed = routes[channelKey];
   if (!routed) return [];
   return Array.isArray(routed) ? routed : [routed];
 }
 
 // Default (implicit) routing when the request omits `targets`.
 // Match today's behavior: source-based route + default webhook.
-function defaultSlackWebhooks(source) {
+function defaultSlackWebhooks(routes, source) {
   const urls = new Set();
-  for (const url of resolveSlackChannel(source)) urls.add(url);
+  for (const url of resolveSlackChannel(routes, source)) urls.add(url);
   if (DEFAULT_WEBHOOK_URL) urls.add(DEFAULT_WEBHOOK_URL);
   return [...urls];
 }
@@ -68,9 +87,9 @@ function buildSlackPayload({ source, message, detail, emoji }) {
 // Given the request's targets (or undefined for implicit routing), return the
 // list of Slack webhook URLs to deliver to. Unknown target types are logged
 // and skipped — explicit targets never silently fall back to the default.
-function resolveTargets(targets, source) {
+function resolveTargets(routes, targets, source) {
   if (targets === undefined) {
-    return defaultSlackWebhooks(source);
+    return defaultSlackWebhooks(routes, source);
   }
   if (!Array.isArray(targets)) return [];
 
@@ -85,9 +104,9 @@ function resolveTargets(targets, source) {
         console.warn('slack target missing channel — skipping');
         continue;
       }
-      const routed = resolveSlackChannel(channelKey);
+      const routed = resolveSlackChannel(routes, channelKey);
       if (routed.length === 0) {
-        console.warn('slack target channel=%s not in SLACK_WEBHOOK_ROUTES — skipping', channelKey);
+        console.warn('slack target channel=%s not in webhook routes — skipping', channelKey);
         continue;
       }
       for (const url of routed) urls.add(url);
@@ -136,7 +155,8 @@ export async function handler(event) {
   };
   console.log(JSON.stringify(logLine));
 
-  const webhooks = resolveTargets(targets, source);
+  const routes = await getWebhookRoutes();
+  const webhooks = resolveTargets(routes, targets, source);
   if (webhooks.length === 0) {
     if (targets === undefined) {
       console.warn('No Slack webhook configured for source=%s — skipping notification', source);
