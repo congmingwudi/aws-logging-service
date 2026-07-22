@@ -284,69 +284,93 @@ exposed to the browser bundle.
 ## Claude Code notification hook
 
 The repo ships a POSIX bash script — `hooks/claude-notify.sh` — that reads a
-Claude Code hook event on stdin and POSTs a log event to this service. Wire it
-into any project (or globally in `~/.claude/settings.json`) to get Slack pings
-when Claude finishes a task, a subagent completes, or Claude is awaiting input.
+Claude Code hook event on stdin and POSTs a log event to this service, to get
+Slack pings when Claude finishes a task, a subagent completes, or Claude is
+awaiting input.
 
-### One-time service configuration
+### Install the hook once, globally — don't reference this repo's path
 
-1. Create a new Slack incoming webhook pointing at the channel you want Claude
-   notifications in.
-2. Redeploy the service with a `SlackWebhookRoutes` entry for `claude-notify`
-   (or any key name you prefer — this doc uses `claude-notify` consistently):
+**Decision:** the hook is registered exactly once, in the *global*
+`~/.claude/settings.json`, pointing at a copy of the script under
+`~/.claude/hooks/`. Individual projects only set a `LOGGING_CHANNEL` env
+override — they never register the hook or point at this repo's checkout.
 
-   ```bash
-   sam build && sam deploy --parameter-overrides \
-     "SlackWebhookUrl=<default-webhook>" \
-     "SlackWebhookRoutes={\"claude-notify\":\"<claude-channel-webhook>\"}" \
-     "ApiKeyValue=<your-api-key>"
-   ```
+Why: pointing a project's `.claude/settings.json` directly at
+`<this-repo>/hooks/claude-notify.sh` makes that project's hook wiring depend
+on this specific repo still existing at that exact path on that exact
+machine. Move, rename, or delete this checkout and every project referencing
+it breaks silently (the script fails soft by design, so you may not notice).
+It also doesn't generalize across machines — a fresh clone of a project has
+no reason to know where you happen to keep `aws-logging-service` checked out.
+Copying the script to a stable, hook-dedicated location and registering it
+once avoids both problems, and matches how other global hooks on this machine
+are already organized (e.g. `~/.aisuite/hooks/`, `~/.devbar/bin/`).
 
-### Configuring the hook in a Claude Code project
+**1. One-time service configuration:**
 
-Two options — global (every project) or per-project.
+Create a new Slack incoming webhook pointing at the channel you want Claude
+notifications in, then redeploy the service with a `SlackWebhookRoutes` entry
+for `claude-notify` (or any key name you prefer — this doc uses `claude-notify`
+consistently):
 
-**Option A — global, in `~/.claude/settings.json`:**
+```bash
+sam build && sam deploy --parameter-overrides \
+  "SlackWebhookUrl=<default-webhook>" \
+  "SlackWebhookRoutes={\"claude-notify\":\"<claude-channel-webhook>\"}" \
+  "ApiKeyValue=<your-api-key>"
+```
 
-Every Claude Code session in every directory will send hook events.
+**2. Install the script into the global hooks directory:**
+
+```bash
+mkdir -p ~/.claude/hooks
+cp hooks/claude-notify.sh ~/.claude/hooks/claude-notify.sh
+chmod +x ~/.claude/hooks/claude-notify.sh
+```
+
+This repo remains the source of truth for edits to the script — re-run the
+copy step after pulling changes. The deployed copy under `~/.claude/hooks/`
+is what every project's hook actually invokes.
+
+**3. Register the hook and shared credentials once, in `~/.claude/settings.json`:**
 
 ```json
 {
   "env": {
     "LOGGING_API_URL": "https://<api-id>.execute-api.us-west-2.amazonaws.com/prod/log",
-    "LOGGING_API_KEY": "<your-api-key>",
-    "LOGGING_CHANNEL": "claude-notify"
+    "LOGGING_API_KEY": "<your-api-key>"
   },
   "hooks": {
-    "Stop":         [{"hooks": [{"type": "command", "command": "/Users/ryan.cox/projects/tdx26/aws-logging-service/hooks/claude-notify.sh"}]}],
-    "SubagentStop": [{"hooks": [{"type": "command", "command": "/Users/ryan.cox/projects/tdx26/aws-logging-service/hooks/claude-notify.sh"}]}],
-    "Notification": [{"hooks": [{"type": "command", "command": "/Users/ryan.cox/projects/tdx26/aws-logging-service/hooks/claude-notify.sh"}]}]
+    "Stop":         [{"matcher": "", "hooks": [{"type": "command", "command": "/Users/<you>/.claude/hooks/claude-notify.sh"}]}],
+    "SubagentStop": [{"matcher": "", "hooks": [{"type": "command", "command": "/Users/<you>/.claude/hooks/claude-notify.sh"}]}],
+    "Notification": [{"matcher": "", "hooks": [{"type": "command", "command": "/Users/<you>/.claude/hooks/claude-notify.sh"}]}]
   }
 }
 ```
 
-**Option B — per-project, in `<project>/.claude/settings.json`:**
+Every Claude Code session on the machine will now send hook events. Merge
+these entries into any hooks/env you already have configured — don't
+overwrite existing arrays under `Stop`/`SubagentStop`/`Notification`, append
+to them instead.
 
-Only enabled inside that specific repo. Same JSON as above; put it in the
-project's own settings file instead of the global one. Useful when you only want
-notifications for long-running projects and not throwaway experiments.
+**4. Per-project: only set the routing/labeling overrides you need.**
 
-**Option C — per-project source override:**
-
-By default the hook tags every event with `source = basename(pwd)` (e.g., the
-repo directory name). To force a specific source label per project, add
-`LOGGING_SOURCE` to that project's `.claude/settings.json` `env` block:
+In `<project>/.claude/settings.local.json` (untracked; keep secrets and
+machine-specific config out of the tracked `settings.json`):
 
 ```json
 {
   "env": {
-    "LOGGING_SOURCE": "my-critical-app"
+    "LOGGING_CHANNEL": "claude-notify"
   }
 }
 ```
 
-Project-level `env` merges with global `env`, so you can set the URL/key once
-globally and override just `LOGGING_SOURCE` per project.
+Project-level `env` merges with global `env`, so the URL/key are inherited and
+each project only overrides `LOGGING_CHANNEL` (and optionally `LOGGING_SOURCE`
+/ `LOGGING_LEVEL` — see the environment contract below). No project should
+need to touch `hooks` or `LOGGING_API_URL`/`LOGGING_API_KEY` — those live in
+the global config, set up once.
 
 ### Environment contract
 
@@ -405,6 +429,71 @@ stderr, which Claude Code surfaces in its hook logs.
 4. In CloudWatch, `aws logs tail /aws/lambda/mega-demo-logger --region us-west-2`
    should show the corresponding structured log line with the full hook payload
    in `detail`.
+
+## Codex notification hook
+
+The repo also ships `hooks/codex-notify.sh` — the same idea as the Claude Code
+hook, but for [Codex](https://openai.com/codex) lifecycle hooks. It reads a
+Codex hook JSON event on stdin and POSTs the same log shape to this service,
+so Codex sessions can ping Slack too (routed independently via its own
+`SLACK_WEBHOOK_ROUTES` key, `codex-notify`, kept parallel to `claude-notify`).
+
+### Credential reuse
+
+Unlike the Claude hook, `codex-notify.sh` doesn't require its own copy of
+`LOGGING_API_URL` / `LOGGING_API_KEY`. If those aren't set in the environment,
+it falls back to reading `env.LOGGING_API_URL` / `env.LOGGING_API_KEY` /
+`env.LOGGING_CHANNEL` out of `~/.claude/settings.json` (path overridable via
+`CODEX_NOTIFY_SETTINGS`) via `jq`. This avoids duplicating the API key into a
+second config file — set explicit environment variables in Codex's own hook
+config only if you want Codex to use different credentials or a different
+`LOGGING_CHANNEL` than Claude Code.
+
+### One-time service configuration
+
+Create a new Slack incoming webhook for the channel you want Codex
+notifications in, then redeploy with a `codex-notify` entry in
+`SlackWebhookRoutes` alongside any existing routes:
+
+```bash
+sam build && sam deploy --parameter-overrides \
+  "SlackWebhookUrl=<default-webhook>" \
+  "SlackWebhookRoutes={\"claude-notify\":\"<claude-channel-webhook>\",\"codex-notify\":\"<codex-channel-webhook>\"}" \
+  "ApiKeyValue=<your-api-key>"
+```
+
+### Install the script
+
+Codex reads its hook config from its own settings (outside this repo's
+scope), but the script itself should live at a stable path the same way
+`claude-notify.sh` does:
+
+```bash
+mkdir -p ~/.codex/hooks
+cp hooks/codex-notify.sh ~/.codex/hooks/codex-notify.sh
+chmod +x ~/.codex/hooks/codex-notify.sh
+```
+
+Point Codex's own hook configuration (e.g. its `Stop` / `PermissionRequest`
+equivalents) at `~/.codex/hooks/codex-notify.sh`, and set `LOGGING_CHANNEL=codex-notify`
+if you want Codex events routed to its own channel rather than inheriting
+whatever `LOGGING_CHANNEL` Claude Code's settings specify.
+
+### Level derivation
+
+| Hook event | Level sent | Slack indicator |
+|------------|-----------|-----------------|
+| `Stop` | `success` | :large_green_circle: |
+| `SubagentStop` | `success` | :large_green_circle: |
+| `PermissionRequest` | `notify` | :bell: |
+| anything else | `info` | :large_blue_circle: |
+
+Override with `LOGGING_LEVEL` if you want different behavior.
+
+### Failure behavior
+
+Same fail-soft contract as `claude-notify.sh`: exits `0` on any error (missing
+credentials, network failure), never blocks Codex, and logs errors to stderr.
 
 ## Teardown
 
